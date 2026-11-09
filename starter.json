@@ -1,0 +1,20 @@
+{
+  "name": "Kart Circuit",
+  "genre": "racing",
+  "dim": "3D",
+  "mode": "Versus",
+  "players": "2–8",
+  "hook": "Three laps, item boxes and drift boosts.",
+  "how": "Drift through corners to charge a boost. Item boxes give a speed boost or a shell for whoever is just ahead. First over the line after three laps wins.",
+  "controls": "Arrow keys, Shift to drift, Space for items, or on-screen buttons",
+  "uses": [
+    ["Leaderboard", "The fastest laps on the track."],
+    ["Rounds", "Races start, finish and restart together for everyone."],
+    ["Bots", "Bots fill the grid until enough people join."]
+  ],
+  "ideas": [
+    "Add a second track in the snow",
+    "Add a banana you drop behind you",
+    "Let players pick a kart color before the race"
+  ]
+}

@@ -1,0 +1,568 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Kart Circuit</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none; background: #7cc6f0; }
+  body { font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; user-select: none; -webkit-user-select: none; }
+  canvas { display: block; touch-action: none; }
+  .hud { position: fixed; pointer-events: none; text-shadow: 0 2px 4px #0009; font-weight: 800; }
+  #pos { top: max(12px, env(safe-area-inset-top)); left: 16px; font-size: 40px; line-height: 1; }
+  #pos small { font-size: 18px; opacity: .85; }
+  #lap { top: calc(max(12px, env(safe-area-inset-top)) + 46px); left: 16px; font-size: 16px; }
+  #item { top: max(12px, env(safe-area-inset-top)); right: 16px; width: 64px; height: 64px; border-radius: 14px; border: 3px solid #fff;
+          background: #0004; display: grid; place-items: center; font-size: 30px; }
+  #item:empty { opacity: .3; }
+  #net { bottom: max(10px, env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%); font-size: 12px; font-weight: 600; opacity: .8; white-space: nowrap; }
+  #count { inset: 0; display: grid; place-items: center; font-size: min(26vw, 180px); color: #ffd23f; -webkit-text-stroke: 4px #6a2c00; }
+  #msg { top: 30%; left: 0; right: 0; text-align: center; font-size: 22px; }
+  #over { position: fixed; inset: 0; display: grid; place-items: center; background: #0006; }
+  #over[hidden], .pad[hidden] { display: none; }
+  .card { width: min(380px, 90vw); max-height: 86vh; overflow: auto; padding: 20px; border-radius: 16px; background: #1b2140; border: 1px solid #ffffff2a; }
+  .card h2 { margin: 0 0 8px; font-size: 22px; }
+  .card h3 { margin: 14px 0 4px; font-size: 14px; color: #ffd23f; }
+  .card ol { margin: 0; padding-left: 24px; font-size: 14px; }
+  .card li span { float: right; font-variant-numeric: tabular-nums; }
+  .card li.me { color: #ffd23f; font-weight: 700; }
+  .card p { margin: 12px 0 0; font-size: 13px; opacity: .8; }
+  .pad { position: fixed; bottom: max(16px, env(safe-area-inset-bottom)); display: flex; gap: 12px; }
+  .pad button { width: 76px; height: 76px; border-radius: 50%; border: 2px solid #ffffff88; background: #00000033; color: #fff; font: 800 15px system-ui, sans-serif; touch-action: none; }
+  .pad button.on { background: #ffffff55; }
+  #padL { left: max(16px, env(safe-area-inset-left)); } #padR { right: max(16px, env(safe-area-inset-right)); }
+</style>
+<script src="https://cdn.multiplayeragent.com/sdk/mp.global.js"></script>
+<script type="importmap">{ "imports": { "three": "./libs/three.module.min.js" } }</script>
+</head>
+<body>
+<div class="hud" id="pos"></div>
+<div class="hud" id="lap"></div>
+<div class="hud" id="item"></div>
+<div class="hud" id="net">Connecting…</div>
+<div class="hud" id="count"></div>
+<div class="hud" id="msg"></div>
+<div class="pad" id="padL" hidden><button data-k="left">◀</button><button data-k="right">▶</button></div>
+<div class="pad" id="padR" hidden><button data-k="drift">DRIFT</button><button data-k="item">ITEM</button></div>
+<div id="over" hidden><div class="card">
+  <h2>Results</h2><ol id="results"></ol>
+  <h3>Best laps on this track</h3><ol id="board"><li>Loading…</li></ol>
+  <p id="next"></p>
+</div></div>
+<script type="module">
+/* ═══ KART CIRCUIT · a Multiplayer Agent starter ═══════════════════════════════════════
+ * Three laps, item boxes and drift boosts. Versus, 2–8 players; bots fill empty seats.
+ *
+ * WHERE THINGS ARE (search for the "── " headers):
+ *   CONFIG ........ laps, speeds, the track's shape, bots
+ *   CONNECTION .... MP_CONNECT, joining, the offline room, who is host
+ *   TRACK ......... the road, curbs, scenery and item boxes, built from CONFIG.track
+ *   KARTS ......... the kart model and name tags
+ *   RACE (HOST) ... the race phases (grid, race, done) and the bots. Only the host writes these.
+ *   MY KART ....... driving, drifting, items, laps. Each player writes only its own kart.
+ *   HUD & RESULTS . position, laps, countdown, results, leaderboard
+ *   INPUT ......... keyboard and touch
+ *
+ * HOW THE MULTIPLAYER WORKS (a relay room: no server code):
+ *   - Each player writes its OWN entity: `k` (one packed JSON field: position, heading,
+ *     speed, lap, progress, finish time, spin) about 15 times a second, `hb` (heartbeat)
+ *     once a second, and `n`/`c` (name, color) once.
+ *   - The HOST is the lowest sessionId among live players (heartbeat seen in the last 3s),
+ *     worked out every frame. Only the host writes the shared fields `race` (id, phase,
+ *     start and end times, results) and `bots`. A new host adopts both from state.
+ *   - A new race starts only when the host bumps race.id; every client then resets to
+ *     its grid slot. Someone who joins mid-race starts from the line.
+ *   - Shells are events (effects only): "shell" {to}. A hit player spins out its own
+ *     kart; the host spins a hit bot.
+ *   - ?attract plays offline with bots only (the preview video is recorded from it).
+ *   - Leaderboard "best-lap": each player's fastest lap (stored as 600000 - ms, so higher
+ *     is better), shown on the results card.
+ */
+import * as THREE from "three";
+
+// ── CONFIG ──────────────────────────────────────────────────────────────────────────
+const CONFIG = {
+  laps: 3,
+  seats: 6,            // bots fill the race up to this many karts
+  vmax: 40,            // top speed, units/s
+  accel: 24, brake: 45, turn: 2.1,
+  offroad: 0.45,       // top speed multiplier on the grass
+  boost: 1.45,         // top speed multiplier while boosting
+  roadWidth: 16,
+  countdown: 5000,     // ms on the grid before GO
+  afterFirst: 25000,   // ms the race stays open after the first finisher
+  resultsFor: 9000,    // ms the results show before the next race
+  board: "best-lap",
+  // The track: points the road passes through, in order (it loops back to the first).
+  track: [[0, 0], [90, -14], [170, 14], [205, 92], [160, 160], [80, 145], [35, 190], [-60, 205], [-145, 160], [-175, 65], [-130, -15], [-65, -45]],
+};
+const BOT_NAMES = ["Zoom", "Dash", "Turbo", "Skid", "Nitro", "Blip", "Rocket"];
+const COLORS = ["#ff4d4d", "#4da6ff", "#ffd23f", "#52d273", "#c77dff", "#ff8c42", "#ff6fb5", "#3de0d0"];
+
+// ── CONNECTION ──────────────────────────────────────────────────────────────────────
+// The builder fills these in for this game. Downloaded from GitHub? Put your own pk_ key here.
+const MP_CONNECT = {
+  key: 'pk_REPLACE_ME',
+  room: 'kart-circuit',
+  endpoint: 'wss://live.multiplayeragent.com',
+  apiUrl: 'https://api.multiplayeragent.com',
+};
+const ATTRACT = new URLSearchParams(location.search).has("attract");
+
+/** Same shape as the SDK client, kept in this tab: offline play and ?attract. */
+function localRoom() {
+  const id = "local", state = { entities: { players: { [id]: {} } }, shared: {} }, subs = [];
+  let queued = false;
+  const emit = () => { if (!queued) { queued = true; queueMicrotask(() => { queued = false; subs.forEach((f) => f(state)); }); } };
+  const put = (o, k, v) => { if (typeof k === "object") Object.assign(o, k); else o[k] = v; emit(); };
+  return {
+    sessionId: id, state, offline: true,
+    me: { set: (k, v) => put(state.entities.players[id], k, v) },
+    setShared: (k, v) => put(state.shared, k, v),
+    onState: (f) => { subs.push(f); f(state); }, onJoin() {}, onLeave() {}, on() {}, send() {},
+    onDisconnect() {}, onReconnect() {}, leave: async () => {},
+  };
+}
+async function connect() {
+  if (ATTRACT || typeof MP === "undefined") return localRoom();
+  try {
+    const mp = await Promise.race([MP.join({ ...MP_CONNECT }), new Promise((_, no) => setTimeout(() => no(new Error("timed out")), 10000))]);
+    window.mp = mp; // the builder calls window.mp.leave() when the page closes
+    return mp;
+  } catch (e) {
+    console.warn("Playing offline:", e && e.message);
+    return localRoom();
+  }
+}
+const parse = (v, fb) => { if (typeof v !== "string") return fb; try { return JSON.parse(v); } catch { return fb; } };
+let net = null, S = { entities: { players: {} }, shared: {} };
+const seenHb = new Map();
+function livePlayers() {
+  const now = performance.now(), out = [];
+  for (const [id, p] of Object.entries(S.entities.players || {})) {
+    const s = seenHb.get(id);
+    if (!s || s.hb !== p.hb) seenHb.set(id, { hb: p.hb, at: now });
+    if (id === net.sessionId || now - seenHb.get(id).at < 3000) out.push(id);
+  }
+  return out.sort();
+}
+const isHost = () => livePlayers()[0] === net.sessionId;
+
+// ── TRACK ───────────────────────────────────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio || 1));
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color("#7cc6f0");
+scene.fog = new THREE.Fog("#7cc6f0", 140, 420);
+const camera = new THREE.PerspectiveCamera(68, 1, 0.5, 900);
+function fit() { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+addEventListener("resize", fit); addEventListener("orientationchange", fit); fit();
+scene.add(new THREE.HemisphereLight("#ffffff", "#4a7a3a", 1.4));
+const sun = new THREE.DirectionalLight("#fff3d6", 1.6); sun.position.set(80, 140, 40); scene.add(sun);
+
+const curve = new THREE.CatmullRomCurve3(CONFIG.track.map(([x, z]) => new THREE.Vector3(x, 0, z)), true, "catmullrom", 0.5);
+const N = 600, P = curve.getSpacedPoints(N).slice(0, N), TLEN = curve.getLength();
+const T = P.map((p, i) => P[(i + 1) % N].clone().sub(p).normalize());
+const L = T.map((t) => new THREE.Vector3(t.z, 0, -t.x)); // the left of the road at each point
+const half = CONFIG.roadWidth / 2;
+
+function canvasTex(w, h, paint, repeat) {
+  const c = document.createElement("canvas"); c.width = w; c.height = h; paint(c.getContext("2d"), w, h);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 4;
+  if (repeat) { t.wrapS = t.wrapT = THREE.RepeatWrapping; }
+  return t;
+}
+/** A strip that follows the track from offset a to offset b (left is +). */
+function strip(a, b, y, mat, vScale) {
+  const pos = [], uv = [], idx = [];
+  let d = 0;
+  for (let i = 0; i <= N; i++) {
+    const k = i % N, p = P[k], l = L[k];
+    if (i) d += P[k].distanceTo(P[(i - 1) % N]);
+    pos.push(p.x + l.x * a, y, p.z + l.z * a, p.x + l.x * b, y, p.z + l.z * b);
+    uv.push(0, d / vScale, 1, d / vScale);
+    if (i < N) { const j = i * 2; idx.push(j, j + 2, j + 1, j + 1, j + 2, j + 3); }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx); g.computeVertexNormals();
+  const m = new THREE.Mesh(g, mat); scene.add(m); return m;
+}
+const asphalt = canvasTex(128, 128, (c, w, h) => {
+  c.fillStyle = "#4a4f5a"; c.fillRect(0, 0, w, h);
+  for (let i = 0; i < 500; i++) { c.fillStyle = `rgba(255,255,255,${Math.random() * 0.06})`; c.fillRect(Math.random() * w, Math.random() * h, 2, 2); }
+  c.fillStyle = "#fff"; c.fillRect(2, 0, 4, h); c.fillRect(w - 6, 0, 4, h); c.fillStyle = "#ffffffaa"; c.fillRect(w / 2 - 2, 0, 4, h / 2);
+}, true);
+const curbTex = canvasTex(8, 64, (c, w, h) => { c.fillStyle = "#e33"; c.fillRect(0, 0, w, h); c.fillStyle = "#fff"; c.fillRect(0, 0, w, h / 2); }, true);
+strip(-half, half, 0.02, new THREE.MeshStandardMaterial({ map: asphalt, roughness: 0.95 }), 14);
+strip(half, half + 1.6, 0.03, new THREE.MeshStandardMaterial({ map: curbTex }), 6);
+strip(-half - 1.6, -half, 0.03, new THREE.MeshStandardMaterial({ map: curbTex }), 6);
+const grassTex = canvasTex(64, 64, (c) => { c.fillStyle = "#5fb24a"; c.fillRect(0, 0, 64, 64); c.fillStyle = "#58a845"; c.fillRect(0, 0, 32, 32); c.fillRect(32, 32, 32, 32); }, true);
+grassTex.repeat.set(120, 120);
+const grass = new THREE.Mesh(new THREE.PlaneGeometry(1200, 1200), new THREE.MeshStandardMaterial({ map: grassTex, roughness: 1 }));
+grass.rotation.x = -Math.PI / 2; grass.position.set(15, -0.01, 80); scene.add(grass);
+// Start line
+const checker = canvasTex(64, 16, (c) => { for (let x = 0; x < 16; x++) for (let y = 0; y < 4; y++) { c.fillStyle = (x + y) % 2 ? "#111" : "#fff"; c.fillRect(x * 4, y * 4, 4, 4); } });
+const line = new THREE.Mesh(new THREE.PlaneGeometry(CONFIG.roadWidth, 2.4), new THREE.MeshBasicMaterial({ map: checker }));
+line.rotation.x = -Math.PI / 2; line.rotation.z = Math.atan2(T[0].x, T[0].z); line.position.copy(P[0]).setY(0.04); scene.add(line);
+
+// Scenery: the same trees for everyone (seeded), kept off the road.
+function mulberry32(a) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+const seeded = mulberry32(7);
+const trees = new THREE.InstancedMesh(new THREE.ConeGeometry(3.2, 9, 7), new THREE.MeshStandardMaterial({ color: "#2f8a3e", flatShading: true }), 160);
+const trunks = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.6, 0.8, 2.4, 6), new THREE.MeshStandardMaterial({ color: "#7a4e2a" }), 160);
+const mtx = new THREE.Matrix4();
+for (let i = 0, placed = 0; placed < 160 && i < 4000; i++) {
+  const x = -260 + seeded() * 500, z = -120 + seeded() * 420, p = new THREE.Vector3(x, 0, z);
+  if (P.some((q) => q.distanceToSquared(p) < (half + 9) ** 2)) continue;
+  const s = 0.7 + seeded() * 0.8;
+  mtx.compose(new THREE.Vector3(x, 5.6 * s, z), new THREE.Quaternion(), new THREE.Vector3(s, s, s)); trees.setMatrixAt(placed, mtx);
+  mtx.compose(new THREE.Vector3(x, 1.2 * s, z), new THREE.Quaternion(), new THREE.Vector3(s, s, s)); trunks.setMatrixAt(placed, mtx);
+  placed++;
+}
+scene.add(trees, trunks);
+
+// Item boxes: three rows across the road. Taking one hides it on YOUR screen for 2s.
+const boxTex = canvasTex(64, 64, (c) => { const g = c.createLinearGradient(0, 0, 64, 64); g.addColorStop(0, "#ff6fb5"); g.addColorStop(0.5, "#ffd23f"); g.addColorStop(1, "#4da6ff"); c.fillStyle = g; c.fillRect(0, 0, 64, 64); c.fillStyle = "#fff"; c.font = "bold 46px system-ui"; c.textAlign = "center"; c.fillText("?", 32, 49); });
+const boxes = [];
+for (const t of [0.2, 0.52, 0.8]) for (const off of [-5, 0, 5]) {
+  const i = Math.floor(t * N), m = new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2), new THREE.MeshStandardMaterial({ map: boxTex, emissive: "#ffffff", emissiveIntensity: 0.25, transparent: true, opacity: 0.92 }));
+  m.position.copy(P[i]).addScaledVector(L[i], off).setY(1.6); scene.add(m); boxes.push({ m, hiddenUntil: 0 });
+}
+
+/** Nearest track point to (x, z), searching near `hint` first. */
+function nearest(x, z, hint) {
+  let best = 0, bd = Infinity;
+  const scan = (from, to) => { for (let j = from; j <= to; j++) { const k = ((j % N) + N) % N, d = (P[k].x - x) ** 2 + (P[k].z - z) ** 2; if (d < bd) { bd = d; best = k; } } };
+  if (hint >= 0) scan(hint - 25, hint + 25);
+  if (hint < 0 || bd > 30 * 30) scan(0, N - 1);
+  return { i: best, d: Math.sqrt(bd) };
+}
+/** Grid slot `n` behind the start line. */
+function gridSlot(n) {
+  const back = (N - 4 - Math.floor(n / 2) * 5 + N) % N, side = n % 2 ? -3.2 : 3.2;
+  const p = P[back].clone().addScaledVector(L[back], side);
+  return { x: p.x, z: p.z, h: Math.atan2(T[0].x, T[0].z), i: back };
+}
+
+// ── KARTS ───────────────────────────────────────────────────────────────────────────
+const wheelGeo = new THREE.CylinderGeometry(0.45, 0.45, 0.4, 12).rotateZ(Math.PI / 2), black = new THREE.MeshStandardMaterial({ color: "#222" });
+function makeKart(color, name) {
+  const g = new THREE.Group(), mat = new THREE.MeshStandardMaterial({ color, roughness: 0.5 });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(1.9, 0.55, 3.0), mat); body.position.y = 0.6; g.add(body);
+  const nose = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.35, 0.9), mat); nose.position.set(0, 0.55, 1.8); g.add(nose);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.5, 16, 12), new THREE.MeshStandardMaterial({ color: "#fff" })); head.position.set(0, 1.35, -0.3); g.add(head);
+  const visor = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.22, 0.2), new THREE.MeshStandardMaterial({ color: "#123" })); visor.position.set(0, 1.4, 0.15); g.add(visor);
+  for (const [x, z] of [[-1, 1.1], [1, 1.1], [-1, -1.1], [1, -1.1]]) { const w = new THREE.Mesh(wheelGeo, black); w.position.set(x, 0.45, z); g.add(w); }
+  const shadow = new THREE.Mesh(new THREE.CircleGeometry(1.8, 16), new THREE.MeshBasicMaterial({ color: "#000", transparent: true, opacity: 0.25 }));
+  shadow.rotation.x = -Math.PI / 2; shadow.position.y = 0.05; g.add(shadow);
+  const sparks = new THREE.Mesh(new THREE.SphereGeometry(0.35, 8, 6), new THREE.MeshBasicMaterial({ color: "#6cf" })); sparks.position.set(0, 0.3, -1.8); sparks.visible = false; g.add(sparks);
+  g.userData.sparks = sparks;
+  if (name) {
+    const tex = canvasTex(256, 64, (c) => { c.font = "bold 34px system-ui"; c.textAlign = "center"; c.lineWidth = 6; c.strokeStyle = "#000a"; c.strokeText(name, 128, 44); c.fillStyle = "#fff"; c.fillText(name, 128, 44); });
+    const tag = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false })); tag.scale.set(5, 1.25, 1); tag.position.y = 3; g.add(tag);
+  }
+  scene.add(g); return g;
+}
+const views = new Map(); // id -> { g, x, z, h } drawn karts for everyone but me
+function viewOf(id, color, name) {
+  let v = views.get(id);
+  if (v && v.color !== color) { scene.remove(v.g); v.g = makeKart(color, ATTRACT ? "" : name); v.color = color; } // they changed color
+  if (!v) { v = { g: makeKart(color, ATTRACT ? "" : name), color, x: 0, z: 0, h: 0, fresh: true }; views.set(id, v); }
+  return v;
+}
+
+// ── RACE (HOST) ─────────────────────────────────────────────────────────────────────
+const host = { bots: new Map(), wasHost: false, lastBots: 0, raceId: 0, last: null };
+/** The race as state has it, or the host's own newer write that hasn't come back yet. `v` only goes up. */
+function race() {
+  const r = parse(S.shared.race, null);
+  return host.last && isHost() && (!r || host.last.v > r.v) ? host.last : r;
+}
+function writeRace(r) { r = { ...r, v: (race()?.v ?? 0) + 1 }; host.last = r; net.setShared("race", JSON.stringify(r)); return r; }
+
+/** How far round the race someone is: laps + share of a lap (negative while still behind the line on the grid). */
+const progress = (x) => x.lap + x.t - (x.t > 0.5 && !x.half ? 1 : 0);
+/** Everyone in the race, as { id, name, lap, t, half, ft }: humans from their karts, bots from the host. */
+function racers() {
+  const out = [];
+  for (const [id, p] of Object.entries(S.entities.players || {})) {
+    if (id === net.sessionId) { out.push({ id, name: "You", lap: me.lap, t: me.i / N, half: me.half, ft: me.ft, mine: true }); continue; }
+    const k = parse(p.k, null); if (k) out.push({ id, name: p.n || "Player", lap: k.l, t: k.t / N, half: !!k.hf, ft: k.ft });
+  }
+  for (const b of botList()) out.push({ id: b.i, name: b.n, lap: b.l, t: b.t / N, half: !!b.hf, ft: b.ft, bot: true });
+  return out.sort((a, b) => (a.ft && b.ft ? a.ft - b.ft : a.ft ? -1 : b.ft ? 1 : progress(b) - progress(a)));
+}
+function botList() {
+  if (isHost()) return [...host.bots.values()].map((b) => ({ i: b.id, n: b.name, c: b.color, x: b.x, z: b.z, h: b.h, l: b.lap, t: Math.floor(b.f), ft: b.ft, hf: b.half ? 1 : 0, sp: b.spin > 0 ? 1 : 0 }));
+  return parse(S.shared.bots, []);
+}
+
+function spawnBots(r, humans) {
+  const want = Math.max(0, CONFIG.seats - humans.length);
+  const keep = [...host.bots.values()].slice(0, want);
+  host.bots.clear();
+  keep.forEach((b) => host.bots.set(b.id, b));
+  while (host.bots.size < want) {
+    const used = new Set([...host.bots.values()].map((b) => b.name)), name = BOT_NAMES.find((n) => !used.has(n)) || "Bot";
+    const id = "b" + Math.random().toString(36).slice(2, 6);
+    host.bots.set(id, { id, name, color: COLORS[(host.bots.size + 3) % COLORS.length], skill: 0.8 + Math.random() * 0.12 });
+  }
+  let n = humans.length;
+  for (const b of host.bots.values()) { const s = gridSlot(n++); Object.assign(b, { x: s.x, z: s.z, h: s.h, f: s.i, lap: 0, ft: 0, v: 0, lane: (n % 2 ? 1 : -1) * 3, spin: 0, half: false }); }
+}
+
+function hostTick(dt, now) {
+  if (!host.wasHost) { // adopt the bots exactly as state has them
+    host.wasHost = true; host.bots.clear();
+    for (const b of parse(S.shared.bots, [])) host.bots.set(b.i, { id: b.i, name: b.n, color: b.c, x: b.x, z: b.z, h: b.h, f: b.t, lap: b.l, ft: b.ft, v: CONFIG.vmax * 0.8, lane: 0, spin: 0, skill: 0.86, half: !!b.hf });
+  }
+  let r = race();
+  const humans = livePlayers().filter((id) => !(ATTRACT && id === net.sessionId));
+  if (!r) r = writeRace({ id: 1, phase: "grid", startAt: Date.now() + CONFIG.countdown, endsAt: 0, results: [] });
+  if (host.raceId !== r.id) { host.raceId = r.id; if (r.phase === "grid") spawnBots(r, humans); }
+  const t = Date.now();
+  if (r.phase === "grid" && t >= r.startAt) r = writeRace({ ...r, phase: "race" });
+  if (r.phase === "race") {
+    const all = racers(), done = all.filter((x) => x.ft);
+    const humansDone = all.filter((x) => !x.bot && (!ATTRACT || !x.mine)).every((x) => x.ft);
+    if (done.length && !r.endsAt) r = writeRace({ ...r, endsAt: t + CONFIG.afterFirst });
+    if ((done.length && humansDone && humans.length) || (r.endsAt && t > r.endsAt) || t - r.startAt > 300000 || (ATTRACT && done.length >= 3)) {
+      r = writeRace({ ...r, phase: "done", endsAt: t + CONFIG.resultsFor, results: all.map((x) => ({ id: x.id, n: x.name === "You" ? myName : x.name, ft: x.ft || 0 })) });
+    }
+  }
+  if (r.phase === "done" && t > r.endsAt) writeRace({ id: r.id + 1, phase: "grid", startAt: t + CONFIG.countdown, endsAt: 0, results: [] });
+  // Bots drive along the racing line, a little faster when they're behind the humans.
+  const lead = Math.max(0, ...racers().filter((x) => !x.bot).map(progress));
+  for (const b of host.bots.values()) {
+    if (r.phase !== "race" || b.ft) { b.v = Math.max(0, b.v - 30 * dt); }
+    else if (b.spin > 0) { b.spin -= dt; b.v *= 1 - 2.5 * dt; b.h += 9 * dt; }
+    else {
+      const gap = progress({ lap: b.lap, t: b.f / N, half: b.half }) - lead, top = CONFIG.vmax * b.skill * (gap > 0.15 ? 0.9 : gap < -0.1 ? 1.08 : 1);
+      b.v = Math.min(top, b.v + CONFIG.accel * dt);
+    }
+    // progress is a fractional index along the track, so slow bots still creep forward
+    const prev = b.f;
+    b.f = (b.f + (b.v * dt) / (TLEN / N)) % N;
+    b.lane += (Math.sin(t / 1300 + b.id.charCodeAt(1)) * 4 - b.lane) * dt;
+    const i = Math.floor(b.f), j = (i + 1) % N, fr = b.f - i;
+    b.x = P[i].x + (P[j].x - P[i].x) * fr + L[i].x * b.lane; b.z = P[i].z + (P[j].z - P[i].z) * fr + L[i].z * b.lane;
+    if (b.spin <= 0) b.h = Math.atan2(T[i].x, T[i].z);
+    if (b.f > N * 0.45 && b.f < N * 0.6) b.half = true;
+    if (b.f < prev && b.half) { b.lap++; b.half = false; if (b.lap >= CONFIG.laps && !b.ft) b.ft = Date.now() - r.startAt; }
+  }
+  if (now - host.lastBots > 100) { host.lastBots = now; net.setShared("bots", JSON.stringify(botList().map((b) => ({ ...b, x: +b.x.toFixed(1), z: +b.z.toFixed(1), h: +b.h.toFixed(2) })))); }
+}
+
+// ── MY KART ─────────────────────────────────────────────────────────────────────────
+const myName = (() => { try { return localStorage.getItem("mpa-name") || ""; } catch { return ""; } })() ||
+  ["Ace", "Blaze", "Comet", "Flash", "Jet", "Spark"][Math.floor(Math.random() * 6)] + " " + (10 + Math.floor(Math.random() * 90));
+let myColor = COLORS[0]; // picked on join: the first color nobody in the room has
+/** Two people joined at once in one color: the one with the higher sessionId picks a free one. */
+function fixColor() {
+  const others = Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId);
+  if (!others.some(([id, p]) => p.c === myColor && id < net.sessionId)) return;
+  const taken = new Set(others.map(([, p]) => p.c)), free = COLORS.find((c) => !taken.has(c));
+  if (free) { myColor = free; net.me.set("c", free); if (me.g) { scene.remove(me.g); me.g = null; } }
+}
+const me = { g: null, x: 0, z: 0, h: 0, v: 0, i: 0, lap: 0, half: false, ft: 0, drift: 0, charge: 0, boost: 0, spin: 0, item: "", raceId: -1, lapStart: 0, best: 0, lastSend: 0, submitted: -1 };
+const input = { left: false, right: false, gas: false, brake: false, drift: false, item: false };
+
+function resetToGrid(r) {
+  me.raceId = r.id;
+  const slot = ATTRACT ? gridSlot(CONFIG.seats) : r.phase === "grid" ? gridSlot(Math.max(0, livePlayers().indexOf(net.sessionId))) : gridSlot(0);
+  Object.assign(me, { x: slot.x, z: slot.z, h: slot.h, i: slot.i, v: 0, lap: 0, half: false, ft: 0, drift: 0, charge: 0, boost: 0, spin: 0, item: "", lapStart: r.startAt });
+  for (const b of boxes) b.hiddenUntil = 0;
+  $("over").hidden = true;
+}
+
+function useItem(r) {
+  if (!me.item || r.phase !== "race") return;
+  if (me.item === "boost") me.boost = 1.4;
+  else { // a shell for whoever is just ahead
+    const order = racers(), at = order.findIndex((x) => x.mine), target = order[at - 1];
+    if (target) { net.send("shell", { to: target.id }); shellFx(net.sessionId, target.id); if (target.bot && isHost()) hitBot(target.id); }
+  }
+  me.item = "";
+}
+const hitBot = (id) => { const b = host.bots.get(id); if (b) b.spin = 1.2; };
+
+function myTick(dt, r) {
+  if (me.raceId !== r.id) resetToGrid(r);
+  const racing = r.phase === "race" && !me.ft;
+  if (ATTRACT) autopilot();
+  if (!racing) { me.v = Math.max(0, me.v - 30 * dt); }
+  else if (me.spin > 0) { me.spin -= dt; me.v *= 1 - 2.5 * dt; me.h += 9 * dt; }
+  else {
+    const steer = (input.left ? 1 : 0) - (input.right ? 1 : 0);
+    const near = nearest(me.x, me.z, me.i), off = near.d > half + 1;
+    const top = CONFIG.vmax * (off ? CONFIG.offroad : 1) * (me.boost > 0 ? CONFIG.boost : 1);
+    if (input.gas) me.v += CONFIG.accel * dt; else if (input.brake) me.v -= CONFIG.brake * dt; else me.v -= Math.sign(me.v) * 8 * dt;
+    if (me.v > top) me.v = Math.max(top, me.v - 35 * dt);
+    me.v = Math.max(-CONFIG.vmax * 0.3, me.v);
+    if (input.drift && !me.drift && steer && me.v > CONFIG.vmax * 0.5) { me.drift = steer; me.charge = 0; }
+    if (me.drift && (!input.drift || me.v < CONFIG.vmax * 0.3)) { if (me.charge > 0.7) me.boost = me.charge > 1.6 ? 1.3 : 0.8; me.drift = 0; }
+    if (me.drift) me.charge += dt * (steer === me.drift ? 1.2 : 0.6);
+    const turn = me.drift ? me.drift * 0.75 + steer * 0.45 : steer;
+    me.h += turn * CONFIG.turn * dt * Math.max(-1, Math.min(1, me.v / (CONFIG.vmax * 0.4)));
+  }
+  me.boost = Math.max(0, me.boost - dt);
+  const slide = me.drift * 0.28;
+  me.x += Math.sin(me.h + slide) * me.v * dt; me.z += Math.cos(me.h + slide) * me.v * dt;
+  // bump out of other karts
+  for (const [id, v] of views) { if (!v.g.visible) continue; const dx = me.x - v.x, dz = me.z - v.z, d = Math.hypot(dx, dz); if (d < 2.6 && d > 0.01) { me.x += (dx / d) * (2.6 - d); me.z += (dz / d) * (2.6 - d); me.v *= 0.97; } }
+  const prev = me.i, n = nearest(me.x, me.z, me.i); me.i = n.i;
+  if (n.d > half + 40) { const p = P[me.i]; me.x = p.x; me.z = p.z; me.v = 0; } // way off: back onto the road
+  if (racing) {
+    if (me.i > N * 0.45 && me.i < N * 0.6) me.half = true;
+    if (prev > N * 0.9 && me.i < N * 0.1 && me.half) {
+      me.half = false; me.lap++;
+      const lapMs = Date.now() - me.lapStart; me.lapStart = Date.now();
+      if (!me.best || lapMs < me.best) me.best = lapMs;
+      if (me.lap >= CONFIG.laps) me.ft = Date.now() - r.startAt;
+    }
+    if (prev < N * 0.1 && me.i > N * 0.9) me.half = false; // backwards over the line
+    for (const b of boxes) if (b.hiddenUntil < performance.now() && b.m.position.distanceToSquared(new THREE.Vector3(me.x, 1.6, me.z)) < 9) {
+      b.hiddenUntil = performance.now() + 2000;
+      if (!me.item) me.item = Math.random() < 0.6 ? "boost" : "shell";
+    }
+  }
+  if (input.item) { input.item = false; if (racing) useItem(r); }
+  const now = performance.now();
+  if (now - me.lastSend > 66) { me.lastSend = now; net.me.set("k", JSON.stringify({ x: +me.x.toFixed(1), z: +me.z.toFixed(1), h: +me.h.toFixed(2), l: me.lap, t: me.i, hf: me.half ? 1 : 0, ft: me.ft, d: me.drift ? 1 : 0, sp: me.spin > 0 ? 1 : 0 })); }
+}
+
+/** ?attract: your kart drives itself along the racing line. */
+function autopilot() {
+  const ahead = P[(me.i + 14) % N], want = Math.atan2(ahead.x - me.x, ahead.z - me.z);
+  const diff = Math.atan2(Math.sin(want - me.h), Math.cos(want - me.h));
+  input.left = diff > 0.05; input.right = diff < -0.05; input.gas = me.v < CONFIG.vmax * 0.86; // trails the pack, so the camera sees it
+  input.drift = Math.abs(diff) > 0.35; if (me.item && Math.random() < 0.01) input.item = true;
+}
+
+// Shells: a green ball from one kart to another (effect only, the hit is in state).
+const shells = [];
+function shellFx(from, to) {
+  const m = new THREE.Mesh(new THREE.SphereGeometry(0.6, 12, 8), new THREE.MeshStandardMaterial({ color: "#2ecc71", emissive: "#145a32" }));
+  scene.add(m); shells.push({ m, from, to, t: 0 });
+}
+const posOf = (id) => (id === net.sessionId ? { x: me.x, z: me.z } : views.get(id) || null);
+
+// ── HUD & RESULTS ───────────────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+const ord = (n) => n + (n % 10 === 1 && n % 100 !== 11 ? "st" : n % 10 === 2 && n % 100 !== 12 ? "nd" : n % 10 === 3 && n % 100 !== 13 ? "rd" : "th");
+const fmt = (ms) => `${Math.floor(ms / 60000)}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, "0")}.${String(Math.floor(ms % 1000)).padStart(3, "0")}`;
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+let board = null, boardFor = -1;
+function hud(r) {
+  if (ATTRACT) { for (const id of ["pos", "lap", "item", "net", "msg"]) $(id).textContent = ""; $("item").style.display = "none"; }
+  const t = Date.now();
+  $("count").textContent = r.phase === "grid" && r.startAt - t < 3000 ? String(Math.ceil((r.startAt - t) / 1000)) : r.phase === "race" && t - r.startAt < 900 ? "GO!" : "";
+  if (ATTRACT) return;
+  const order = racers(), at = order.findIndex((x) => x.mine) + 1;
+  $("pos").innerHTML = at ? `${ord(at)} <small>/ ${order.length}</small>` : "";
+  $("lap").textContent = me.ft ? `Finished · ${fmt(me.ft)}` : `Lap ${Math.min(CONFIG.laps, me.lap + 1)}/${CONFIG.laps}${me.best ? ` · best ${fmt(me.best)}` : ""}`;
+  $("item").textContent = me.item === "boost" ? "🍄" : me.item === "shell" ? "🟢" : "";
+  $("msg").textContent = r.phase === "grid" && r.startAt - t >= 3000 ? "Next race starting…" : me.ft && r.phase === "race" ? "Waiting for the others…" : "";
+  const n = livePlayers().length;
+  $("net").textContent = net.offline ? "Offline: racing bots" : `Online · ${n} player${n === 1 ? "" : "s"}${isHost() ? " · you run the bots" : ""}`;
+  $("over").hidden = r.phase !== "done";
+  if (r.phase === "done") {
+    $("results").innerHTML = r.results.map((x) => `<li class="${x.id === net.sessionId ? "me" : ""}">${esc(x.n)}<span>${x.ft ? fmt(x.ft) : "DNF"}</span></li>`).join("");
+    $("next").textContent = `Next race in ${Math.max(0, Math.ceil((r.endsAt - t) / 1000))}s`;
+    if (boardFor !== r.id) { boardFor = r.id; showBoard(); }
+  }
+}
+function showBoard() {
+  const list = $("board");
+  if (!board) { list.innerHTML = "<li>Leaderboards need a connection.</li>"; return; }
+  const submit = me.best && me.submitted !== me.raceId ? board.submit(Math.max(0, 600000 - me.best)).catch(() => null) : Promise.resolve();
+  me.submitted = me.raceId;
+  submit.then(() => board.top(10)).then(({ entries }) => {
+    list.innerHTML = entries.length ? entries.map((e) => `<li>${esc(e.username || "Player")}<span>${fmt(600000 - e.score)}</span></li>`).join("") : "<li>No laps yet. Set the first.</li>";
+  }).catch(() => { list.innerHTML = "<li>Couldn't load the leaderboard.</li>"; });
+}
+
+// ── INPUT ───────────────────────────────────────────────────────────────────────────
+const touchUI = matchMedia("(pointer: coarse)").matches && !ATTRACT;
+$("padL").hidden = $("padR").hidden = !touchUI;
+const KEYS = { ArrowLeft: "left", a: "left", ArrowRight: "right", d: "right", ArrowUp: "gas", w: "gas", ArrowDown: "brake", s: "brake", Shift: "drift", " ": "item" };
+addEventListener("keydown", (e) => { const k = KEYS[e.key]; if (k) { e.preventDefault(); input[k] = true; } });
+addEventListener("keyup", (e) => { const k = KEYS[e.key]; if (k && k !== "item") input[k] = false; });
+for (const b of document.querySelectorAll(".pad button")) {
+  const k = b.dataset.k, on = (v) => { input[k] = v; b.classList.toggle("on", v); };
+  b.addEventListener("pointerdown", (e) => { e.preventDefault(); b.setPointerCapture(e.pointerId); on(true); });
+  for (const ev of ["pointerup", "pointercancel"]) b.addEventListener(ev, () => { if (k !== "item") on(false); else b.classList.remove("on"); });
+}
+document.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+
+// ── MAIN LOOP ───────────────────────────────────────────────────────────────────────
+let last = performance.now(), lastHb = 0, lastHud = 0;
+const camPos = new THREE.Vector3(), camLook = new THREE.Vector3();
+function frame(now) {
+  const dt = Math.max(0, Math.min(0.05, (now - last) / 1000)); last = now; // the first frame can be stamped before `last`
+  if (now - lastHb > 1000) { lastHb = now; net.me.set("hb", Date.now()); fixColor(); }
+  if (touchUI) input.gas = !input.brake; // touch drives on its own
+  if (isHost()) hostTick(dt, now); else host.wasHost = false;
+  const r = race();
+  if (r) myTick(dt, r);
+  // everyone else's karts, eased toward where they last said they were
+  const seen = new Set();
+  for (const [id, p] of Object.entries(S.entities.players || {})) {
+    if (id === net.sessionId) continue;
+    const k = parse(p.k, null); if (!k) continue;
+    seen.add(id); place(viewOf(id, p.c || "#ccc", p.n || "Player"), k.x, k.z, k.h, k.d, dt);
+  }
+  for (const b of botList()) { seen.add(b.i); place(viewOf(b.i, b.c, b.n), b.x, b.z, b.h, 0, dt); }
+  for (const [id, v] of views) if (!seen.has(id)) { scene.remove(v.g); views.delete(id); }
+  // my kart
+  if (!me.g) me.g = makeKart(myColor, "");
+  me.g.position.set(me.x, 0, me.z); me.g.rotation.y = me.h;
+  me.g.userData.sparks.visible = !!me.drift; me.g.userData.sparks.material.color.set(me.charge > 1.6 ? "#ff8c42" : me.charge > 0.7 ? "#ffd23f" : "#6cf");
+  // shells in flight
+  for (let i = shells.length - 1; i >= 0; i--) {
+    const s = shells[i], a = posOf(s.from), b = posOf(s.to); s.t += dt / 0.7;
+    if (!a || !b || s.t >= 1) { scene.remove(s.m); shells.splice(i, 1); continue; }
+    s.m.position.set(a.x + (b.x - a.x) * s.t, 1 + Math.sin(s.t * Math.PI) * 3, a.z + (b.z - a.z) * s.t);
+  }
+  for (const b of boxes) { b.m.visible = b.hiddenUntil < now; b.m.rotation.y += dt * 1.5; b.m.rotation.x += dt * 0.7; }
+  // chase camera
+  const fwd = new THREE.Vector3(Math.sin(me.h), 0, Math.cos(me.h));
+  camPos.set(me.x, 0, me.z).addScaledVector(fwd, -10).setY(ATTRACT ? 6 : 5);
+  camLook.set(me.x, 1.2, me.z).addScaledVector(fwd, 5);
+  camera.position.lerp(camPos, 1 - Math.pow(0.002, dt));
+  camera.lookAt(camLook);
+  camera.fov += ((me.boost > 0 ? 80 : 68) - camera.fov) * 0.08; camera.updateProjectionMatrix();
+  renderer.render(scene, camera);
+  if (r && now - lastHud > 100) { lastHud = now; hud(r); }
+  requestAnimationFrame(frame);
+}
+function place(v, x, z, h, drift, dt) {
+  if (v.fresh) { v.x = x; v.z = z; v.h = h; v.fresh = false; }
+  const k = 1 - Math.pow(0.0005, dt);
+  v.x += (x - v.x) * k; v.z += (z - v.z) * k; v.h += Math.atan2(Math.sin(h - v.h), Math.cos(h - v.h)) * k;
+  v.g.position.set(v.x, 0, v.z); v.g.rotation.y = v.h; v.g.userData.sparks.visible = !!drift;
+}
+
+(async function start() {
+  net = await connect();
+  net.onState((st) => { S = st; });
+  net.on("shell", (msg, from) => {
+    if (!msg) return;
+    shellFx(from, msg.to);
+    if (msg.to === net.sessionId) setTimeout(() => { me.spin = 1.2; me.drift = 0; }, 700);
+    else if (isHost() && host.bots.has(msg.to)) setTimeout(() => hitBot(msg.to), 700);
+  });
+  net.onDisconnect(() => { $("net").textContent = "Reconnecting…"; });
+  if (!net.offline && typeof MP !== "undefined") board = MP.auth({ key: MP_CONNECT.key, apiUrl: MP_CONNECT.apiUrl }).leaderboard(CONFIG.board);
+  const taken = new Set(Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId).map(([, p]) => p.c));
+  myColor = COLORS.find((c) => !taken.has(c)) || COLORS[Math.floor(Math.random() * COLORS.length)];
+  net.me.set({ n: myName, c: myColor, hb: Date.now() });
+  if (ATTRACT) { CONFIG.countdown = 1500; CONFIG.resultsFor = 1500; }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
