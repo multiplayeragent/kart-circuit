@@ -20,7 +20,7 @@
   #msg { top: 30%; left: 0; right: 0; text-align: center; font-size: 22px; }
   #over { position: fixed; inset: 0; display: grid; place-items: center; background: #0006; }
   #over[hidden], .pad[hidden] { display: none; }
-  .card { width: min(380px, 90vw); max-height: 86vh; overflow: auto; padding: 20px; border-radius: 16px; background: #1b2140; border: 1px solid #ffffff2a; }
+  .card { box-sizing: border-box; width: min(422px, calc(100vw - 32px)); max-height: 86vh; overflow: auto; padding: 20px; border-radius: 16px; background: #1b2140; border: 1px solid #ffffff2a; }
   .card h2 { margin: 0 0 8px; font-size: 22px; }
   .card h3 { margin: 14px 0 4px; font-size: 14px; color: #ffd23f; }
   .card ol { margin: 0; padding-left: 24px; font-size: 14px; }
@@ -287,8 +287,9 @@ function writeRace(r) { r = { ...r, v: (race()?.v ?? 0) + 1 }; host.last = r; ne
 const progress = (x) => x.lap + x.t - (x.t > 0.5 && !x.half ? 1 : 0);
 /** Everyone in the race, as { id, name, lap, t, half, ft }: humans from their karts, bots from the host. */
 function racers() {
-  const out = [];
+  const out = [], live = new Set(livePlayers()); // a closed tab's kart stays in state for a while: skip it
   for (const [id, p] of Object.entries(S.entities.players || {})) {
+    if (!live.has(id)) continue;
     if (id === net.sessionId) { out.push({ id, name: "You", lap: me.lap, t: me.i / N, half: me.half, ft: me.ft, mine: true }); continue; }
     const k = parse(p.k, null); if (k) out.push({ id, name: p.n || "Player", lap: k.l, t: k.t / N, half: !!k.hf, ft: k.ft });
   }
@@ -308,7 +309,9 @@ function spawnBots(r, humans) {
   while (host.bots.size < want) {
     const used = new Set([...host.bots.values()].map((b) => b.name)), name = BOT_NAMES.find((n) => !used.has(n)) || "Bot";
     const id = "b" + Math.random().toString(36).slice(2, 6);
-    host.bots.set(id, { id, name, color: COLORS[(host.bots.size + 3) % COLORS.length], skill: 0.8 + Math.random() * 0.12 });
+    const usedC = new Set([myColor, ...Object.values(S.entities.players || {}).map((p) => p.c), ...[...host.bots.values()].map((b) => b.color)]);
+    const color = [...COLORS.keys()].map((k) => COLORS[(host.bots.size + 3 + k) % COLORS.length]).find((c) => !usedC.has(c)) || COLORS[(host.bots.size + 3) % COLORS.length];
+    host.bots.set(id, { id, name, color, skill: 0.8 + Math.random() * 0.12 });
   }
   let n = humans.length;
   for (const b of host.bots.values()) { const s = gridSlot(n++); Object.assign(b, { x: s.x, z: s.z, h: s.h, f: s.i, lap: 0, ft: 0, v: 0, lane: (n % 2 ? 1 : -1) * 3, spin: 0, half: false }); }
@@ -317,7 +320,7 @@ function spawnBots(r, humans) {
 function hostTick(dt, now) {
   if (!host.wasHost) { // adopt the bots exactly as state has them
     host.wasHost = true; host.bots.clear();
-    for (const b of parse(S.shared.bots, [])) host.bots.set(b.i, { id: b.i, name: b.n, color: b.c, x: b.x, z: b.z, h: b.h, f: b.t, lap: b.l, ft: b.ft, v: CONFIG.vmax * 0.8, lane: 0, spin: 0, skill: 0.86, half: !!b.hf });
+    for (const b of parse(S.shared.bots, [])) host.bots.set(b.i, { id: b.i, name: b.n, color: b.c, x: b.x, z: b.z, h: b.h, f: b.t, lap: b.l, ft: b.ft, v: CONFIG.vmax * 0.8, lane: (b.x - P[b.t].x) * L[b.t].x + (b.z - P[b.t].z) * L[b.t].z, spin: 0, skill: 0.86, half: !!b.hf }); // lane = its sideways offset, so it doesn't jump to the middle
   }
   let r = race();
   const humans = livePlayers().filter((id) => !(ATTRACT && id === net.sessionId));
@@ -360,11 +363,11 @@ function hostTick(dt, now) {
 const myName = (() => { try { return localStorage.getItem("mpa-name") || ""; } catch { return ""; } })() ||
   ["Ace", "Blaze", "Comet", "Flash", "Jet", "Spark"][Math.floor(Math.random() * 6)] + " " + (10 + Math.floor(Math.random() * 90));
 let myColor = COLORS[0]; // picked on join: the first color nobody in the room has
-/** Two people joined at once in one color: the one with the higher sessionId picks a free one. */
+/** Two people joined at once in one color (or a bot has mine): the one with the higher sessionId picks a free one. */
 function fixColor() {
-  const others = Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId);
-  if (!others.some(([id, p]) => p.c === myColor && id < net.sessionId)) return;
-  const taken = new Set(others.map(([, p]) => p.c)), free = COLORS.find((c) => !taken.has(c));
+  const others = Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId), botColors = botList().map((b) => b.c);
+  if (!others.some(([id, p]) => p.c === myColor && id < net.sessionId) && !botColors.includes(myColor)) return;
+  const taken = new Set([...others.map(([, p]) => p.c), ...botColors]), free = COLORS.find((c) => !taken.has(c));
   if (free) { myColor = free; net.me.set("c", free); if (me.g) { scene.remove(me.g); me.g = null; } }
 }
 const me = { g: null, x: 0, z: 0, h: 0, v: 0, i: 0, lap: 0, half: false, ft: 0, drift: 0, charge: 0, boost: 0, spin: 0, item: "", raceId: -1, lapStart: 0, best: 0, lastSend: 0, submitted: -1 };
@@ -456,6 +459,7 @@ const ord = (n) => n + (n % 10 === 1 && n % 100 !== 11 ? "st" : n % 10 === 2 && 
 const fmt = (ms) => `${Math.floor(ms / 60000)}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, "0")}.${String(Math.floor(ms % 1000)).padStart(3, "0")}`;
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 let board = null, boardFor = -1;
+let dropped = false; // true while the connection is down: the HUD keeps showing "Reconnecting…"
 function hud(r) {
   if (ATTRACT) { for (const id of ["pos", "lap", "item", "net", "msg"]) $(id).textContent = ""; $("item").style.display = "none"; }
   const t = Date.now();
@@ -467,7 +471,7 @@ function hud(r) {
   $("item").textContent = me.item === "boost" ? "🍄" : me.item === "shell" ? "🟢" : "";
   $("msg").textContent = r.phase === "grid" && r.startAt - t >= 3000 ? "Next race starting…" : me.ft && r.phase === "race" ? "Waiting for the others…" : "";
   const n = livePlayers().length;
-  $("net").textContent = net.offline ? "Offline: racing bots" : `Online · ${n} player${n === 1 ? "" : "s"}${isHost() ? " · you run the bots" : ""}`;
+  $("net").textContent = net.offline ? "Offline: racing bots" : dropped ? "Reconnecting…" : `Online · ${n} player${n === 1 ? "" : "s"}${isHost() ? " · you run the bots" : ""}`;
   $("over").hidden = r.phase !== "done";
   if (r.phase === "done") {
     $("results").innerHTML = r.results.map((x) => `<li class="${x.id === net.sessionId ? "me" : ""}">${esc(x.n)}<span>${x.ft ? fmt(x.ft) : "DNF"}</span></li>`).join("");
@@ -509,9 +513,9 @@ function frame(now) {
   const r = race();
   if (r) myTick(dt, r);
   // everyone else's karts, eased toward where they last said they were
-  const seen = new Set();
+  const seen = new Set(), live = new Set(livePlayers());
   for (const [id, p] of Object.entries(S.entities.players || {})) {
-    if (id === net.sessionId) continue;
+    if (id === net.sessionId || !live.has(id)) continue;
     const k = parse(p.k, null); if (!k) continue;
     seen.add(id); place(viewOf(id, p.c || "#ccc", p.n || "Player"), k.x, k.z, k.h, k.d, dt);
   }
@@ -555,9 +559,10 @@ function place(v, x, z, h, drift, dt) {
     if (msg.to === net.sessionId) setTimeout(() => { me.spin = 1.2; me.drift = 0; }, 700);
     else if (isHost() && host.bots.has(msg.to)) setTimeout(() => hitBot(msg.to), 700);
   });
-  net.onDisconnect(() => { $("net").textContent = "Reconnecting…"; });
+  net.onDisconnect(() => { dropped = true; $("net").textContent = "Reconnecting…"; });
+  net.onReconnect(() => { dropped = false; });
   if (!net.offline && typeof MP !== "undefined") board = MP.auth({ key: MP_CONNECT.key, apiUrl: MP_CONNECT.apiUrl }).leaderboard(CONFIG.board);
-  const taken = new Set(Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId).map(([, p]) => p.c));
+  const taken = new Set([...Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId).map(([, p]) => p.c), ...parse(S.shared.bots, []).map((b) => b.c)]);
   myColor = COLORS.find((c) => !taken.has(c)) || COLORS[Math.floor(Math.random() * COLORS.length)];
   net.me.set({ n: myName, c: myColor, hb: Date.now() });
   if (ATTRACT) { CONFIG.countdown = 1500; CONFIG.resultsFor = 1500; }
