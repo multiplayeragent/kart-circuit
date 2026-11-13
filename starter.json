@@ -5,12 +5,12 @@
   "mode": "Versus",
   "players": "2–8",
   "hook": "Three laps, item boxes and drift boosts.",
-  "how": "Drift through corners to charge a boost. Item boxes give a speed boost or a shell for whoever is just ahead. First over the line after three laps wins.",
-  "controls": "Arrow keys, Shift to drift, Space for items, or on-screen buttons",
+  "how": "Drift through corners to charge a boost. Item boxes give a speed boost or a shell that spins out whoever is just ahead (or just behind, if you lead). First over the line after three laps wins.",
+  "controls": "Arrow keys or WASD, Shift to drift, Space for items, or on-screen buttons",
   "uses": [
     ["Leaderboard", "The fastest laps on the track."],
     ["Rounds", "Races start, finish and restart together for everyone."],
-    ["Bots", "Bots fill the grid until enough people join."]
+    ["Bots", "Bots fill the grid until enough people join. They drift, boost and fire shells too."]
   ],
   "ideas": [
     "Add a second track in the snow",

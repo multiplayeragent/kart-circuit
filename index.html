@@ -17,7 +17,9 @@
   #item:empty { opacity: .3; }
   #net { bottom: max(10px, env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%); font-size: 12px; font-weight: 600; opacity: .8; white-space: nowrap; }
   #count { inset: 0; display: grid; place-items: center; font-size: min(26vw, 180px); color: #ffd23f; -webkit-text-stroke: 4px #6a2c00; }
-  #msg { top: 30%; left: 0; right: 0; text-align: center; font-size: 22px; }
+  #msg { top: 30%; left: 0; right: 0; padding: 0 16px; text-align: center; font-size: 22px; }
+  #msg small { display: block; margin-top: 6px; font-size: 14px; font-weight: 600; opacity: .9; }
+  .touch #net { bottom: calc(max(16px, env(safe-area-inset-bottom)) + 86px); } /* above the touch buttons */
   #over { position: fixed; inset: 0; display: grid; place-items: center; background: #0006; }
   #over[hidden], .pad[hidden] { display: none; }
   .card { box-sizing: border-box; width: min(422px, calc(100vw - 32px)); max-height: 86vh; overflow: auto; padding: 20px; border-radius: 16px; background: #1b2140; border: 1px solid #ffffff2a; }
@@ -58,22 +60,26 @@
  *   CONNECTION .... MP_CONNECT, joining, the offline room, who is host
  *   TRACK ......... the road, curbs, scenery and item boxes, built from CONFIG.track
  *   KARTS ......... the kart model and name tags
- *   RACE (HOST) ... the race phases (grid, race, done) and the bots. Only the host writes these.
+ *   RACE (HOST) ... the race phases (grid, race, done) and the bots (driving, items, drifts). Only the host writes these.
  *   MY KART ....... driving, drifting, items, laps. Each player writes only its own kart.
+ *   ITEMS ......... item boxes and shells, the same for players and bots
  *   HUD & RESULTS . position, laps, countdown, results, leaderboard
  *   INPUT ......... keyboard and touch
  *
  * HOW THE MULTIPLAYER WORKS (a relay room: no server code):
  *   - Each player writes its OWN entity: `k` (one packed JSON field: position, heading,
- *     speed, lap, progress, finish time, spin) about 15 times a second, `hb` (heartbeat)
- *     once a second, and `n`/`c` (name, color) once.
+ *     speed, lap, progress, finish time, drifting, boosting, spinning) about 15 times a
+ *     second, `hb` (heartbeat) once a second, and `n`/`c` (name, color) once.
  *   - The HOST is the lowest sessionId among live players (heartbeat seen in the last 3s),
  *     worked out every frame. Only the host writes the shared fields `race` (id, phase,
- *     start and end times, results) and `bots`. A new host adopts both from state.
+ *     start and end times, results) and `bots` (each bot's place, lap, speed and the item
+ *     it holds). A new host adopts both from state.
  *   - A new race starts only when the host bumps race.id; every client then resets to
  *     its grid slot. Someone who joins mid-race starts from the line.
- *   - Shells are events (effects only): "shell" {to}. A hit player spins out its own
- *     kart; the host spins a hit bot.
+ *   - Items are events: "box" {i} (someone took item box i: it hides on every screen) and
+ *     "shell" {to, x, z, ms} (a shell flies from x,z to kart `to` in ms). The event carries
+ *     all it takes to draw the shell, so every screen shows it. When it lands, the player
+ *     it hit spins out its own kart; the host spins a hit bot.
  *   - ?attract plays offline with bots only (the preview video is recorded from it).
  *   - Leaderboard "best-lap": each player's fastest lap (stored as 600000 - ms, so higher
  *     is better), shown on the results card.
@@ -84,10 +90,16 @@ import * as THREE from "three";
 const CONFIG = {
   laps: 3,
   seats: 6,            // bots fill the race up to this many karts
+  botSkill: 0.76,      // a bot's top speed is this share of yours, plus up to 0.12 (each bot differs)
   vmax: 40,            // top speed, units/s
   accel: 24, brake: 45, turn: 2.1,
   offroad: 0.45,       // top speed multiplier on the grass
   boost: 1.45,         // top speed multiplier while boosting
+  shellChance: 0.4,    // share of item boxes that hold a shell (the rest hold a boost)
+  shellSpeed: 80,      // how fast a shell flies, units/s
+  spinFor: 1.2,        // seconds a kart spins out when a shell hits it
+  boxBack: 2000,       // ms until a taken item box comes back
+  botShellRange: 150,  // a bot keeps its shell until its target is this close (units of road)
   roadWidth: 16,
   countdown: 5000,     // ms on the grid before GO
   afterFirst: 25000,   // ms the race stays open after the first finisher
@@ -157,7 +169,12 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color("#7cc6f0");
 scene.fog = new THREE.Fog("#7cc6f0", 140, 420);
 const camera = new THREE.PerspectiveCamera(68, 1, 0.5, 900);
-function fit() { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+let baseFov = 68; // wider on a tall (portrait) screen, so the corners stay in view
+function fit() {
+  renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight;
+  baseFov = camera.aspect < 1 ? Math.min(95, (2 * Math.atan(Math.tan((34 * Math.PI) / 180) / camera.aspect) * 180) / Math.PI) : 68;
+  camera.fov = baseFov; camera.updateProjectionMatrix();
+}
 addEventListener("resize", fit); addEventListener("orientationchange", fit); fit();
 scene.add(new THREE.HemisphereLight("#ffffff", "#4a7a3a", 1.4));
 const sun = new THREE.DirectionalLight("#fff3d6", 1.6); sun.position.set(80, 140, 40); scene.add(sun);
@@ -167,6 +184,8 @@ const N = 600, P = curve.getSpacedPoints(N).slice(0, N), TLEN = curve.getLength(
 const T = P.map((p, i) => P[(i + 1) % N].clone().sub(p).normalize());
 const L = T.map((t) => new THREE.Vector3(t.z, 0, -t.x)); // the left of the road at each point
 const half = CONFIG.roadWidth / 2;
+// How much the road turns over the next 12 points (radians, + is a left turn). Bots drift where it is high.
+const BEND = T.map((t, i) => { const u = T[(i + 12) % N]; return Math.atan2(u.x * t.z - u.z * t.x, t.x * u.x + t.z * u.z); });
 
 function canvasTex(w, h, paint, repeat) {
   const c = document.createElement("canvas"); c.width = w; c.height = h; paint(c.getContext("2d"), w, h);
@@ -209,23 +228,23 @@ const checker = canvasTex(64, 16, (c) => { for (let x = 0; x < 16; x++) for (let
 const line = new THREE.Mesh(new THREE.PlaneGeometry(CONFIG.roadWidth, 2.4), new THREE.MeshBasicMaterial({ map: checker }));
 line.rotation.x = -Math.PI / 2; line.rotation.z = Math.atan2(T[0].x, T[0].z); line.position.copy(P[0]).setY(0.04); scene.add(line);
 
-// Scenery: the same trees for everyone (seeded), kept off the road.
+// Scenery: the same trees for everyone (seeded), kept off the road. They are solid: `treeSpots` is what karts bump into.
 function mulberry32(a) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
 const seeded = mulberry32(7);
 const trees = new THREE.InstancedMesh(new THREE.ConeGeometry(3.2, 9, 7), new THREE.MeshStandardMaterial({ color: "#2f8a3e", flatShading: true }), 160);
 const trunks = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.6, 0.8, 2.4, 6), new THREE.MeshStandardMaterial({ color: "#7a4e2a" }), 160);
-const mtx = new THREE.Matrix4();
+const mtx = new THREE.Matrix4(), treeSpots = [];
 for (let i = 0, placed = 0; placed < 160 && i < 4000; i++) {
   const x = -260 + seeded() * 500, z = -120 + seeded() * 420, p = new THREE.Vector3(x, 0, z);
   if (P.some((q) => q.distanceToSquared(p) < (half + 9) ** 2)) continue;
   const s = 0.7 + seeded() * 0.8;
   mtx.compose(new THREE.Vector3(x, 5.6 * s, z), new THREE.Quaternion(), new THREE.Vector3(s, s, s)); trees.setMatrixAt(placed, mtx);
   mtx.compose(new THREE.Vector3(x, 1.2 * s, z), new THREE.Quaternion(), new THREE.Vector3(s, s, s)); trunks.setMatrixAt(placed, mtx);
-  placed++;
+  treeSpots.push({ x, z, r: 2.4 * s }); placed++;
 }
 scene.add(trees, trunks);
 
-// Item boxes: three rows across the road. Taking one hides it on YOUR screen for 2s.
+// Item boxes: three rows across the road. Taking one hides it for everyone until it comes back (see ITEMS).
 const boxTex = canvasTex(64, 64, (c) => { const g = c.createLinearGradient(0, 0, 64, 64); g.addColorStop(0, "#ff6fb5"); g.addColorStop(0.5, "#ffd23f"); g.addColorStop(1, "#4da6ff"); c.fillStyle = g; c.fillRect(0, 0, 64, 64); c.fillStyle = "#fff"; c.font = "bold 46px system-ui"; c.textAlign = "center"; c.fillText("?", 32, 49); });
 const boxes = [];
 for (const t of [0.2, 0.52, 0.8]) for (const off of [-5, 0, 5]) {
@@ -245,7 +264,7 @@ function nearest(x, z, hint) {
 function gridSlot(n) {
   const back = (N - 4 - Math.floor(n / 2) * 5 + N) % N, side = n % 2 ? -3.2 : 3.2;
   const p = P[back].clone().addScaledVector(L[back], side);
-  return { x: p.x, z: p.z, h: Math.atan2(T[0].x, T[0].z), i: back };
+  return { x: p.x, z: p.z, h: Math.atan2(T[back].x, T[back].z), i: back }; // facing along the road where it stands
 }
 
 // ── KARTS ───────────────────────────────────────────────────────────────────────────
@@ -261,17 +280,19 @@ function makeKart(color, name) {
   shadow.rotation.x = -Math.PI / 2; shadow.position.y = 0.05; g.add(shadow);
   const sparks = new THREE.Mesh(new THREE.SphereGeometry(0.35, 8, 6), new THREE.MeshBasicMaterial({ color: "#6cf" })); sparks.position.set(0, 0.3, -1.8); sparks.visible = false; g.add(sparks);
   g.userData.sparks = sparks;
+  const flame = new THREE.Mesh(new THREE.ConeGeometry(0.45, 1.8, 8).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: "#ff8c42" })); flame.position.set(0, 0.6, -2.4); flame.visible = false; g.add(flame);
+  g.userData.flame = flame; // shown while the kart boosts
   if (name) {
     const tex = canvasTex(256, 64, (c) => { c.font = "bold 34px system-ui"; c.textAlign = "center"; c.lineWidth = 6; c.strokeStyle = "#000a"; c.strokeText(name, 128, 44); c.fillStyle = "#fff"; c.fillText(name, 128, 44); });
-    const tag = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false })); tag.scale.set(5, 1.25, 1); tag.position.y = 3; g.add(tag);
+    const tag = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false })); tag.scale.set(5, 1.25, 1); tag.position.y = 3; g.add(tag); g.userData.tag = tag;
   }
   scene.add(g); return g;
 }
-const views = new Map(); // id -> { g, x, z, h } drawn karts for everyone but me
+const views = new Map(); // id -> { g, x, z, h, ... } drawn karts for everyone but me
 function viewOf(id, color, name) {
   let v = views.get(id);
   if (v && v.color !== color) { scene.remove(v.g); v.g = makeKart(color, ATTRACT ? "" : name); v.color = color; } // they changed color
-  if (!v) { v = { g: makeKart(color, ATTRACT ? "" : name), color, x: 0, z: 0, h: 0, fresh: true }; views.set(id, v); }
+  if (!v) { v = { g: makeKart(color, ATTRACT ? "" : name), color, x: 0, z: 0, h: 0, turn: 0, fresh: true }; views.set(id, v); }
   return v;
 }
 
@@ -298,7 +319,7 @@ function racers() {
   return out.sort((a, b) => (a.ft && b.ft ? a.ft - b.ft : a.ft ? -1 : b.ft ? 1 : progress(b) - progress(a)));
 }
 function botList() {
-  if (isHost()) return [...host.bots.values()].map((b) => ({ i: b.id, n: b.name, c: b.color, x: b.x, z: b.z, h: b.h, l: b.lap, t: Math.floor(b.f), ft: b.ft, hf: b.half ? 1 : 0, sp: b.spin > 0 ? 1 : 0 }));
+  if (isHost()) return [...host.bots.values()].map((b) => ({ i: b.id, n: b.name, c: b.color, x: b.x, z: b.z, h: b.h, l: b.lap, t: Math.floor(b.f), ft: b.ft, hf: b.half ? 1 : 0, sp: b.spin > 0 ? 1 : 0, v: Math.round(b.v), d: b.drift, bo: b.boost > 0 ? 1 : 0, it: b.item }));
   return parse(S.shared.bots, []);
 }
 
@@ -312,16 +333,17 @@ function spawnBots(r, humans) {
     const id = "b" + Math.random().toString(36).slice(2, 6);
     const usedC = new Set([myColor, ...Object.values(S.entities.players || {}).map((p) => p.c), ...[...host.bots.values()].map((b) => b.color)]);
     const color = [...COLORS.keys()].map((k) => COLORS[(host.bots.size + 3 + k) % COLORS.length]).find((c) => !usedC.has(c)) || COLORS[(host.bots.size + 3) % COLORS.length];
-    host.bots.set(id, { id, name, color, skill: 0.8 + Math.random() * 0.12 });
+    host.bots.set(id, { id, name, color, skill: CONFIG.botSkill + Math.random() * 0.12 });
   }
   let n = humans.length;
-  for (const b of host.bots.values()) { const s = gridSlot(n++); Object.assign(b, { x: s.x, z: s.z, h: s.h, f: s.i, lap: 0, ft: 0, v: 0, lane: (n % 2 ? 1 : -1) * 3, spin: 0, half: false }); }
+  for (const b of host.bots.values()) { const s = gridSlot(n++); Object.assign(b, { x: s.x, z: s.z, h: s.h, f: s.i, lap: 0, ft: 0, v: 0, lane: (n % 2 ? 1 : -1) * 3, spin: 0, half: false, item: "", useAt: 0, boost: 0, drift: 0, charge: 0 }); }
 }
 
 function hostTick(dt, now) {
   if (!host.wasHost) { // adopt the bots exactly as state has them
     host.wasHost = true; host.bots.clear();
-    for (const b of parse(S.shared.bots, [])) host.bots.set(b.i, { id: b.i, name: b.n, color: b.c, x: b.x, z: b.z, h: b.h, f: b.t, lap: b.l, ft: b.ft, v: CONFIG.vmax * 0.8, lane: (b.x - P[b.t].x) * L[b.t].x + (b.z - P[b.t].z) * L[b.t].z, spin: 0, skill: 0.86, half: !!b.hf }); // lane = its sideways offset, so it doesn't jump to the middle
+    for (const b of parse(S.shared.bots, [])) host.bots.set(b.i, { id: b.i, name: b.n, color: b.c, x: b.x, z: b.z, h: b.h, f: b.t, lap: b.l, ft: b.ft, v: b.v || 0, lane: (b.x - P[b.t].x) * L[b.t].x + (b.z - P[b.t].z) * L[b.t].z, spin: b.sp ? CONFIG.spinFor / 2 : 0, skill: CONFIG.botSkill + 0.06, half: !!b.hf,
+      item: b.it || "", useAt: Date.now() + 1500, boost: b.bo ? 0.6 : 0, drift: 0, charge: 0 }); // lane = its sideways offset, so it doesn't jump to the middle; it keeps the item it held
   }
   let r = race();
   const humans = livePlayers().filter((id) => !(ATTRACT && id === net.sessionId));
@@ -338,24 +360,46 @@ function hostTick(dt, now) {
     }
   }
   if (r.phase === "done" && t > r.endsAt) writeRace({ id: r.id + 1, phase: "grid", startAt: t + CONFIG.countdown, endsAt: 0, results: [] });
-  // Bots drive along the racing line, a little faster when they're behind the humans.
-  const lead = Math.max(0, ...racers().filter((x) => !x.bot).map(progress));
+  // Bots drive along the racing line, a little faster when they're behind the humans. They play by the
+  // players' rules: they take item boxes, boost, fire shells, drift through the bends and spin out when hit.
+  const order = racers(), lead = Math.max(0, ...order.filter((x) => !x.bot).map(progress));
+  const karts = [...host.bots.values(), me, ...[...views].filter(([id]) => !host.bots.has(id)).map(([, v]) => v)]; // everyone's x, z
   for (const b of host.bots.values()) {
-    if (r.phase !== "race" || b.ft) { b.v = Math.max(0, b.v - 30 * dt); }
-    else if (b.spin > 0) { b.spin -= dt; b.v *= 1 - 2.5 * dt; b.h += 9 * dt; }
-    else {
-      const gap = progress({ lap: b.lap, t: b.f / N, half: b.half }) - lead, top = CONFIG.vmax * b.skill * (gap > 0.15 ? 0.9 : gap < -0.1 ? 1.08 : 1);
-      b.v = Math.min(top, b.v + CONFIG.accel * dt);
+    const racing = r.phase === "race" && !b.ft;
+    b.boost = Math.max(0, b.boost - dt);
+    if (r.phase !== "race") { b.v = Math.max(0, b.v - 30 * dt); b.drift = 0; }
+    else if (b.spin > 0) { b.spin -= dt; b.v *= 1 - 2.5 * dt; b.drift = 0; }
+    else { // a finished bot cruises on at 60%, so it doesn't park on the line in everyone's way
+      const gap = progress({ lap: b.lap, t: b.f / N, half: b.half }) - lead, top = CONFIG.vmax * b.skill * (b.ft ? 0.6 : gap > 0.15 ? 0.9 : gap < -0.1 ? 1.08 : 1) * (b.boost > 0 ? CONFIG.boost : 1);
+      b.v += CONFIG.accel * dt; if (b.v > top) b.v = Math.max(top, b.v - 35 * dt);
+      // drift where the road bends: sparks while it charges, a boost when it straightens out (the player's numbers)
+      const bend = BEND[Math.floor(b.f)];
+      if (!b.drift && Math.abs(bend) > 0.3 && b.v > CONFIG.vmax * 0.5) { b.drift = Math.sign(bend); b.charge = 0; }
+      if (b.drift) { b.charge += dt * 1.2; if (Math.abs(bend) < 0.2 || b.v < CONFIG.vmax * 0.3) { if (b.charge > 0.7) b.boost = b.charge > 1.6 ? 1.3 : 0.8; b.drift = 0; } }
     }
     // progress is a fractional index along the track, so slow bots still creep forward
     const prev = b.f;
     b.f = (b.f + (b.v * dt) / (TLEN / N)) % N;
-    b.lane += (Math.sin(t / 1300 + b.id.charCodeAt(1)) * 4 - b.lane) * dt;
+    b.lane += (Math.sin(t / 1300 + b.id.charCodeAt(1)) * 4 - b.lane) * dt * Math.min(1, b.v / 20); // weaves across the road as it drives (a parked kart stays put)
     const i = Math.floor(b.f), j = (i + 1) % N, fr = b.f - i;
+    // touching another kart: slide sideways out of it
+    for (const o of karts) if (o !== b && (b.x - o.x) ** 2 + (b.z - o.z) ** 2 < 9) b.lane += ((b.x - o.x) * L[i].x + (b.z - o.z) * L[i].z >= 0 ? 1 : -1) * 8 * dt;
+    b.lane = Math.max(1.5 - half, Math.min(half - 1.5, b.lane));
     b.x = P[i].x + (P[j].x - P[i].x) * fr + L[i].x * b.lane; b.z = P[i].z + (P[j].z - P[i].z) * fr + L[i].z * b.lane;
-    if (b.spin <= 0) b.h = Math.atan2(T[i].x, T[i].z);
+    b.h = Math.atan2(T[i].x, T[i].z);
     if (b.f > N * 0.45 && b.f < N * 0.6) b.half = true;
     if (b.f < prev && b.half) { b.lap++; b.half = false; if (b.lap >= CONFIG.laps && !b.ft) b.ft = Date.now() - r.startAt; }
+    if (!racing) continue;
+    // items: take a box, wait a moment like a person would, then use what it gave
+    const k = boxAt(b.x, b.z);
+    if (k >= 0) { takeBox(k); if (!b.item) { b.item = rollItem(); b.useAt = t + 700 + Math.random() * 2500; } }
+    if (b.item && b.spin <= 0 && t >= b.useAt) {
+      if (b.item === "boost") { b.boost = 1.4; b.item = ""; }
+      else { // a shell: only once its target is near enough to be worth it
+        const to = shellTarget(order, b.id), mine = order.find((x) => x.id === b.id);
+        if (to && mine && Math.abs(progress(to) - progress(mine)) * TLEN < CONFIG.botShellRange) { fireShell(b.x, b.z, to.id); b.item = ""; }
+      }
+    }
   }
   if (now - host.lastBots > 100) { host.lastBots = now; net.setShared("bots", JSON.stringify(botList().map((b) => ({ ...b, x: +b.x.toFixed(1), z: +b.z.toFixed(1), h: +b.h.toFixed(2) })))); }
 }
@@ -371,6 +415,7 @@ function fixColor() {
   const taken = new Set([...others.map(([, p]) => p.c), ...botColors]), free = COLORS.find((c) => !taken.has(c));
   if (free) { myColor = free; net.me.set("c", free); if (me.g) { scene.remove(me.g); me.g = null; } }
 }
+const SLIDE = 0.28; // a drifting kart travels this many radians to the side of where it points
 const me = { g: null, x: 0, z: 0, h: 0, v: 0, i: 0, lap: 0, half: false, ft: 0, drift: 0, charge: 0, boost: 0, spin: 0, item: "", raceId: -1, lapStart: 0, best: 0, lastSend: 0, submitted: -1 };
 const input = { left: false, right: false, gas: false, brake: false, drift: false, item: false };
 
@@ -379,26 +424,23 @@ function resetToGrid(r) {
   const slot = ATTRACT ? gridSlot(CONFIG.seats) : r.phase === "grid" ? gridSlot(Math.max(0, livePlayers().indexOf(net.sessionId))) : gridSlot(0);
   Object.assign(me, { x: slot.x, z: slot.z, h: slot.h, i: slot.i, v: 0, lap: 0, half: false, ft: 0, drift: 0, charge: 0, boost: 0, spin: 0, item: "", lapStart: r.startAt });
   for (const b of boxes) b.hiddenUntil = 0;
+  for (const s of shells) scene.remove(s.m); shells.length = 0;
   $("over").hidden = true;
 }
 
 function useItem(r) {
   if (!me.item || r.phase !== "race") return;
-  if (me.item === "boost") me.boost = 1.4;
-  else { // a shell for whoever is just ahead
-    const order = racers(), at = order.findIndex((x) => x.mine), target = order[at - 1];
-    if (target) { net.send("shell", { to: target.id }); shellFx(net.sessionId, target.id); if (target.bot && isHost()) hitBot(target.id); }
-  }
-  me.item = "";
+  if (me.item === "boost") { me.boost = 1.4; me.item = ""; return; }
+  const target = shellTarget(racers(), net.sessionId);
+  if (target) { fireShell(me.x, me.z, target.id); me.item = ""; } // nobody left to hit: keep it
 }
-const hitBot = (id) => { const b = host.bots.get(id); if (b) b.spin = 1.2; };
 
 function myTick(dt, r) {
   if (me.raceId !== r.id) resetToGrid(r);
   const racing = r.phase === "race" && !me.ft;
   if (ATTRACT) autopilot();
-  if (!racing) { me.v = Math.max(0, me.v - 30 * dt); }
-  else if (me.spin > 0) { me.spin -= dt; me.v *= 1 - 2.5 * dt; me.h += 9 * dt; }
+  if (r.phase !== "race") { me.v = Math.max(0, me.v - 30 * dt); } // after the finish you can still drive (out of the way) until the race ends
+  else if (me.spin > 0) { me.spin -= dt; me.v *= 1 - 2.5 * dt; } // spun out by a shell: the kart twirls (see the main loop) but keeps its heading
   else {
     const steer = (input.left ? 1 : 0) - (input.right ? 1 : 0);
     const near = nearest(me.x, me.z, me.i), off = near.d > half + 1;
@@ -413,10 +455,11 @@ function myTick(dt, r) {
     me.h += turn * CONFIG.turn * dt * Math.max(-1, Math.min(1, me.v / (CONFIG.vmax * 0.4)));
   }
   me.boost = Math.max(0, me.boost - dt);
-  const slide = me.drift * 0.28;
+  const slide = me.drift * SLIDE;
   me.x += Math.sin(me.h + slide) * me.v * dt; me.z += Math.cos(me.h + slide) * me.v * dt;
-  // bump out of other karts
-  for (const [id, v] of views) { if (!v.g.visible) continue; const dx = me.x - v.x, dz = me.z - v.z, d = Math.hypot(dx, dz); if (d < 2.6 && d > 0.01) { me.x += (dx / d) * (2.6 - d); me.z += (dz / d) * (2.6 - d); me.v *= 0.97; } }
+  // bump out of trees and other karts
+  for (const t of treeSpots) { const dx = me.x - t.x, dz = me.z - t.z, d = Math.hypot(dx, dz); if (d < t.r && d > 0.01) { me.x += (dx / d) * (t.r - d); me.z += (dz / d) * (t.r - d); me.v *= 0.97; } }
+  for (const [id, v] of views) { const dx = me.x - v.x, dz = me.z - v.z, d = Math.hypot(dx, dz); if (d < 2.6 && d > 0.01) { me.x += (dx / d) * (2.6 - d); me.z += (dz / d) * (2.6 - d); me.v *= 0.97; } }
   const prev = me.i, n = nearest(me.x, me.z, me.i); me.i = n.i;
   if (n.d > half + 40) { const p = P[me.i]; me.x = p.x; me.z = p.z; me.v = 0; } // way off: back onto the road
   if (racing) {
@@ -428,14 +471,12 @@ function myTick(dt, r) {
       if (me.lap >= CONFIG.laps) me.ft = Date.now() - r.startAt;
     }
     if (prev < N * 0.1 && me.i > N * 0.9) me.half = false; // backwards over the line
-    for (const b of boxes) if (b.hiddenUntil < performance.now() && b.m.position.distanceToSquared(new THREE.Vector3(me.x, 1.6, me.z)) < 9) {
-      b.hiddenUntil = performance.now() + 2000;
-      if (!me.item) me.item = Math.random() < 0.6 ? "boost" : "shell";
-    }
+    const k = boxAt(me.x, me.z);
+    if (k >= 0) { takeBox(k); if (!me.item) me.item = rollItem(); }
   }
   if (input.item) { input.item = false; if (racing) useItem(r); }
   const now = performance.now();
-  if (now - me.lastSend > 66) { me.lastSend = now; net.me.set("k", JSON.stringify({ x: +me.x.toFixed(1), z: +me.z.toFixed(1), h: +me.h.toFixed(2), l: me.lap, t: me.i, hf: me.half ? 1 : 0, ft: me.ft, d: me.drift ? 1 : 0, sp: me.spin > 0 ? 1 : 0 })); }
+  if (now - me.lastSend > 66) { me.lastSend = now; net.me.set("k", JSON.stringify({ x: +me.x.toFixed(1), z: +me.z.toFixed(1), h: +me.h.toFixed(2), l: me.lap, t: me.i, hf: me.half ? 1 : 0, ft: me.ft, d: me.drift, sp: me.spin > 0 ? 1 : 0, v: Math.round(me.v), bo: me.boost > 0 ? 1 : 0 })); }
 }
 
 /** ?attract: your kart drives itself along the racing line. */
@@ -446,13 +487,62 @@ function autopilot() {
   input.drift = Math.abs(diff) > 0.35; if (me.item && Math.random() < 0.01) input.item = true;
 }
 
-// Shells: a green ball from one kart to another (effect only, the hit is in state).
-const shells = [];
-function shellFx(from, to) {
-  const m = new THREE.Mesh(new THREE.SphereGeometry(0.6, 12, 8), new THREE.MeshStandardMaterial({ color: "#2ecc71", emissive: "#145a32" }));
-  scene.add(m); shells.push({ m, from, to, t: 0 });
+// ── ITEMS ───────────────────────────────────────────────────────────────────────────
+// The same rules for players and bots. Each player runs these for its own kart, the host for the bots.
+const rollItem = () => (Math.random() < CONFIG.shellChance ? "shell" : "boost");
+/** The item box a kart at (x, z) is driving through, or -1. */
+function boxAt(x, z) {
+  const now = performance.now();
+  return boxes.findIndex((b) => b.hiddenUntil < now && (b.m.position.x - x) ** 2 + (b.m.position.z - z) ** 2 < 9);
 }
-const posOf = (id) => (id === net.sessionId ? { x: me.x, z: me.z } : views.get(id) || null);
+/** Box k was taken: hide it here and tell the others, so it is gone on every screen until it comes back. */
+function takeBox(k) { boxes[k].hiddenUntil = performance.now() + CONFIG.boxBack; net.send("box", { i: k }); }
+
+/** Who a shell from kart `id` goes for: whoever is just ahead; if `id` leads, whoever is just behind. Never a finished kart. */
+function shellTarget(order, id) {
+  const at = order.findIndex((x) => x.id === id);
+  for (let i = at - 1; i >= 0; i--) if (!order[i].ft) return order[i];
+  for (let i = at + 1; at >= 0 && i < order.length; i++) if (!order[i].ft) return order[i];
+  return null;
+}
+const posOf = (id) => (id === net.sessionId ? me : views.get(id) || null);
+// Shells: a green ball that flies from where it was fired to its target, however far, and spins it out.
+const shells = [], shellGeo = new THREE.SphereGeometry(0.8, 14, 10), rimGeo = new THREE.TorusGeometry(0.8, 0.2, 8, 18).rotateX(Math.PI / 2);
+/** Fire a shell from (x, z) at kart `to`. The farther the target, the longer the flight (0.5 to 2.5s). */
+function fireShell(x, z, to) {
+  const p = posOf(to), far = p ? Math.hypot(p.x - x, p.z - z) : 40;
+  const s = { to, x: +x.toFixed(1), z: +z.toFixed(1), ms: Math.round(1000 * Math.max(0.5, Math.min(2.5, far / CONFIG.shellSpeed))) };
+  net.send("shell", s); addShell(s); // send() is not echoed back to the sender, so draw our own
+}
+function addShell(s) {
+  const m = new THREE.Mesh(shellGeo, new THREE.MeshStandardMaterial({ color: "#2ecc71", emissive: "#1e8f4e", transparent: true }));
+  m.add(new THREE.Mesh(rimGeo, new THREE.MeshBasicMaterial({ color: "#fff", transparent: true }))); // a white rim, so it shows against the grass
+  m.position.set(s.x, 1, s.z); scene.add(m);
+  shells.push({ m, to: s.to, x: s.x, z: s.z, ax: s.x, az: s.z, t: 0, secs: Math.max(0.3, Math.min(3, s.ms / 1000)), pop: 0 });
+}
+/** A shell reached kart `id`. I spin out my own kart; the host spins a bot. */
+function shellLanded(id) {
+  const r = race();
+  if (id === net.sessionId) { if (r && r.phase === "race" && !me.ft && me.spin <= 0) { me.spin = CONFIG.spinFor; me.drift = 0; } }
+  else if (isHost()) { const b = host.bots.get(id); if (b && !b.ft && b.spin <= 0) b.spin = CONFIG.spinFor; }
+}
+/** Move the shells in flight (called every frame). */
+function moveShells(dt) {
+  for (let i = shells.length - 1; i >= 0; i--) {
+    const s = shells[i], p = posOf(s.to);
+    if (p) { s.ax = p.x; s.az = p.z; } // it follows its target; if that kart has left, it flies to where it last was
+    if (s.t < 1) {
+      s.t = Math.min(1, s.t + dt / s.secs);
+      s.m.position.set(s.x + (s.ax - s.x) * s.t, 1 + Math.sin(s.t * Math.PI) * 1.5, s.z + (s.az - s.z) * s.t);
+      s.m.rotation.y += dt * 14;
+      if (s.t >= 1) shellLanded(s.to);
+    } else { // landed: a quick burst, then gone
+      s.pop += dt / 0.3; s.m.scale.setScalar(1 + s.pop * 2.5);
+      s.m.material.opacity = s.m.children[0].material.opacity = Math.max(0, 1 - s.pop);
+      if (s.pop >= 1) { scene.remove(s.m); s.m.material.dispose(); s.m.children[0].material.dispose(); shells.splice(i, 1); }
+    }
+  }
+}
 
 // ── HUD & RESULTS ───────────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -470,7 +560,9 @@ function hud(r) {
   $("pos").innerHTML = at ? `${ord(at)} <small>/ ${order.length}</small>` : "";
   $("lap").textContent = me.ft ? `Finished · ${fmt(me.ft)}` : `Lap ${Math.min(CONFIG.laps, me.lap + 1)}/${CONFIG.laps}${me.best ? ` · best ${fmt(me.best)}` : ""}`;
   $("item").textContent = me.item === "boost" ? "🍄" : me.item === "shell" ? "🟢" : "";
-  $("msg").textContent = r.phase === "grid" && r.startAt - t >= 3000 ? "Next race starting…" : me.ft && r.phase === "race" ? "Waiting for the others…" : "";
+  const waiting = r.phase === "grid" && r.startAt - t >= 3000;
+  $("msg").textContent = waiting ? "Next race starting…" : me.ft && r.phase === "race" ? "Waiting for the others…" : "";
+  if (waiting) $("msg").insertAdjacentHTML("beforeend", `<small>${touchUI ? "◀ ▶ steer · hold DRIFT in a bend, let go for a boost · ITEM uses what a box gave you" : "Arrows or WASD drive · hold Shift in a bend to drift, let go for a boost · Space uses your item"}</small>`);
   const n = livePlayers().length;
   $("net").textContent = net.offline ? "Offline: racing bots" : dropped ? "Reconnecting…" : `Online · ${n} player${n === 1 ? "" : "s"}${isHost() ? " · you run the bots" : ""}`;
   $("over").hidden = r.phase !== "done";
@@ -493,9 +585,18 @@ function showBoard() {
 // ── INPUT ───────────────────────────────────────────────────────────────────────────
 const touchUI = matchMedia("(pointer: coarse)").matches && !ATTRACT;
 $("padL").hidden = $("padR").hidden = !touchUI;
-const KEYS = { ArrowLeft: "left", a: "left", ArrowRight: "right", d: "right", ArrowUp: "gas", w: "gas", ArrowDown: "brake", s: "brake", Shift: "drift", " ": "item" };
-addEventListener("keydown", (e) => { const k = KEYS[e.key]; if (k) { e.preventDefault(); input[k] = true; } });
-addEventListener("keyup", (e) => { const k = KEYS[e.key]; if (k && k !== "item") input[k] = false; });
+document.body.classList.toggle("touch", touchUI);
+// Keys by where they sit on the keyboard (e.code), so they still work with Shift or Caps Lock held.
+const KEYS = { ArrowLeft: "left", KeyA: "left", ArrowRight: "right", KeyD: "right", ArrowUp: "gas", KeyW: "gas", ArrowDown: "brake", KeyS: "brake", ShiftLeft: "drift", ShiftRight: "drift", Space: "item" };
+const held = new Set(); // the keys that are down right now
+addEventListener("keydown", (e) => {
+  const k = KEYS[e.code]; if (!k) return;
+  e.preventDefault();
+  if (k === "item") { if (!e.repeat) input.item = true; } else { held.add(e.code); input[k] = true; }
+});
+addEventListener("keyup", (e) => { const k = KEYS[e.code]; held.delete(e.code); if (k && k !== "item") input[k] = [...held].some((c) => KEYS[c] === k); });
+// The tab lost focus: the keyups never arrive, so let go of everything.
+addEventListener("blur", () => { held.clear(); for (const k in input) input[k] = false; for (const b of document.querySelectorAll(".pad button")) b.classList.remove("on"); });
 for (const b of document.querySelectorAll(".pad button")) {
   const k = b.dataset.k, on = (v) => { input[k] = v; b.classList.toggle("on", v); };
   b.addEventListener("pointerdown", (e) => { e.preventDefault(); b.setPointerCapture(e.pointerId); on(true); });
@@ -521,20 +622,16 @@ function frame(now) {
   for (const [id, p] of Object.entries(S.entities.players || {})) {
     if (id === net.sessionId || !live.has(id)) continue;
     const k = parse(p.k, null); if (!k) continue;
-    seen.add(id); place(viewOf(id, p.c || "#ccc", p.n || "Player"), k.x, k.z, k.h, k.d, dt);
+    seen.add(id); place(viewOf(id, p.c || "#ccc", p.n || "Player"), k, (k.d || 0) * SLIDE, dt);
   }
-  for (const b of botList()) { seen.add(b.i); place(viewOf(b.i, b.c, b.n), b.x, b.z, b.h, 0, dt); }
+  for (const b of botList()) { seen.add(b.i); place(viewOf(b.i, b.c, b.n), { ...b, h: b.h - (b.d || 0) * SLIDE }, (b.d || 0) * SLIDE, dt); } // a drifting bot points into the bend, like a drifting player
   for (const [id, v] of views) if (!seen.has(id)) { scene.remove(v.g); views.delete(id); }
   // my kart
   if (!me.g) me.g = makeKart(myColor, "");
-  me.g.position.set(me.x, 0, me.z); me.g.rotation.y = me.h;
+  me.g.position.set(me.x, 0, me.z); me.g.rotation.y = me.h + (me.spin > 0 ? (1 - me.spin / CONFIG.spinFor) * SPIN_TURNS : 0);
+  me.g.userData.flame.visible = me.boost > 0;
   me.g.userData.sparks.visible = !!me.drift; me.g.userData.sparks.material.color.set(me.charge > 1.6 ? "#ff8c42" : me.charge > 0.7 ? "#ffd23f" : "#6cf");
-  // shells in flight
-  for (let i = shells.length - 1; i >= 0; i--) {
-    const s = shells[i], a = posOf(s.from), b = posOf(s.to); s.t += dt / 0.7;
-    if (!a || !b || s.t >= 1) { scene.remove(s.m); shells.splice(i, 1); continue; }
-    s.m.position.set(a.x + (b.x - a.x) * s.t, 1 + Math.sin(s.t * Math.PI) * 3, a.z + (b.z - a.z) * s.t);
-  }
+  moveShells(dt);
   for (const b of boxes) { b.m.visible = b.hiddenUntil < now; b.m.rotation.y += dt * 1.5; b.m.rotation.x += dt * 0.7; }
   // chase camera
   const fwd = new THREE.Vector3(Math.sin(me.h), 0, Math.cos(me.h));
@@ -542,26 +639,35 @@ function frame(now) {
   camLook.set(me.x, 1.2, me.z).addScaledVector(fwd, 5);
   camera.position.lerp(camPos, 1 - Math.pow(0.002, dt));
   camera.lookAt(camLook);
-  camera.fov += ((me.boost > 0 ? 80 : 68) - camera.fov) * 0.08; camera.updateProjectionMatrix();
+  camera.fov += (baseFov + (me.boost > 0 ? 12 : 0) - camera.fov) * 0.08; camera.updateProjectionMatrix();
   renderer.render(scene, camera);
   if (r && now - lastHud > 100) { lastHud = now; hud(r); }
 }
-function place(v, x, z, h, drift, dt) {
-  if (v.fresh) { v.x = x; v.z = z; v.h = h; v.fresh = false; }
-  const k = 1 - Math.pow(0.0005, dt);
-  v.x += (x - v.x) * k; v.z += (z - v.z) * k; v.h += Math.atan2(Math.sin(h - v.h), Math.cos(h - v.h)) * k;
-  v.g.position.set(v.x, 0, v.z); v.g.rotation.y = v.h; v.g.userData.sparks.visible = !!drift;
+const SPIN_TURNS = Math.PI * 4; // a spin-out is two full turns, so the kart ends up facing the way it was going
+/** Draw a kart someone else moves, from its last update `s` (a player's `k` or a bot: x, z, h, v, d, sp, bo).
+ *  Updates come 10-15 times a second, so in between the kart carries on at its own speed and heading, and
+ *  the drawn kart eases onto that: it glides instead of stepping. `slide` is the sideways angle of a drift. */
+function place(v, s, slide, dt) {
+  const now = performance.now(), dir = s.h + slide, speed = s.v || 0;
+  if (v.fresh || s.x !== v.sx || s.z !== v.sz) { v.sx = s.x; v.sz = s.z; v.at = now; } // a new update
+  const age = Math.min(0.25, (now - v.at) / 1000), go = age < 0.25 ? speed : 0; // no news for a while: stop guessing
+  const tx = s.x + Math.sin(dir) * speed * age, tz = s.z + Math.cos(dir) * speed * age;
+  if (v.fresh) { v.x = tx; v.z = tz; v.h = s.h; v.fresh = false; }
+  const k = 1 - Math.pow(0.02, dt), kh = 1 - Math.pow(0.0005, dt); // position is corrected gently (updates arrive unevenly), heading fast
+  v.x += Math.sin(dir) * go * dt; v.z += Math.cos(dir) * go * dt;
+  v.x += (tx - v.x) * k; v.z += (tz - v.z) * k; v.h += Math.atan2(Math.sin(s.h - v.h), Math.cos(s.h - v.h)) * kh;
+  v.turn = s.sp ? v.turn + (dt * SPIN_TURNS) / CONFIG.spinFor : 0;
+  v.g.position.set(v.x, 0, v.z); v.g.rotation.y = v.h + v.turn;
+  v.g.visible = camera.position.distanceToSquared(v.g.position) > 56; // a kart right at the camera (behind you on the grid) would fill the screen: hide it
+  v.g.userData.sparks.visible = !!s.d; v.g.userData.flame.visible = !!s.bo;
+  if (v.g.userData.tag) v.g.userData.tag.visible = camera.position.distanceToSquared(v.g.position) > 81; // a name right in front of the camera would fill the screen
 }
 
 (async function start() {
   net = await connect();
   net.onState((st) => { S = st; });
-  net.on("shell", (msg, from) => {
-    if (!msg) return;
-    shellFx(from, msg.to);
-    if (msg.to === net.sessionId) setTimeout(() => { me.spin = 1.2; me.drift = 0; }, 700);
-    else if (isHost() && host.bots.has(msg.to)) setTimeout(() => hitBot(msg.to), 700);
-  });
+  net.on("shell", (s) => { if (s && typeof s.to === "string" && isFinite(s.x) && isFinite(s.z) && isFinite(s.ms)) addShell(s); });
+  net.on("box", (m) => { const b = m && boxes[m.i]; if (b) b.hiddenUntil = performance.now() + CONFIG.boxBack; });
   net.onDisconnect(() => { dropped = true; $("net").textContent = "Reconnecting…"; });
   net.onReconnect(() => { dropped = false; });
   if (!net.offline && typeof MP !== "undefined") board = MP.auth({ key: MP_CONNECT.key, apiUrl: MP_CONNECT.apiUrl }).leaderboard(CONFIG.board);

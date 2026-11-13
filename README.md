@@ -6,9 +6,9 @@ Three laps, item boxes and drift boosts. A multiplayer starter game from [Multip
 
 ## How it plays
 
-Drift through corners to charge a boost. Item boxes give a speed boost or a shell for whoever is just ahead. First over the line after three laps wins.
+Drift through corners to charge a boost. Item boxes give a speed boost or a shell that spins out whoever is just ahead (or just behind, if you lead). First over the line after three laps wins.
 
-**Controls:** Arrow keys, Shift to drift, Space for items, or on-screen buttons.
+**Controls:** Arrow keys or WASD, Shift to drift, Space for items, or on-screen buttons.
 
 ## Make it yours in the Game Builder
 
@@ -31,7 +31,7 @@ Without a key it still runs, offline against bots.
 - One `index.html` plus three.js in `libs/`. The comment at the top of the script maps the code and explains the multiplayer.
 - **Leaderboard:** The fastest laps on the track.
 - **Rounds:** Races start, finish and restart together for everyone.
-- **Bots:** Bots fill the grid until enough people join.
+- **Bots:** Bots fill the grid until enough people join. They drift, boost and fire shells too.
 - `?attract` runs it offline with bots only. The preview video is recorded from it.
 
 ## License
