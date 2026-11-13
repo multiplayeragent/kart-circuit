@@ -103,6 +103,7 @@ const CONFIG = {
   roadWidth: 16,
   countdown: 5000,     // ms on the grid before GO
   afterFirst: 25000,   // ms the race stays open after the first finisher
+  botsAfterLast: 6000, // ...or this long after the last person finishes, so bots close behind still get a time
   resultsFor: 9000,    // ms the results show before the next race
   board: "best-lap",
   // The track: points the road passes through, in order (it loops back to the first).
@@ -355,7 +356,8 @@ function hostTick(dt, now) {
     const all = racers(), done = all.filter((x) => x.ft);
     const humansDone = all.filter((x) => !x.bot && (!ATTRACT || !x.mine)).every((x) => x.ft);
     if (done.length && !r.endsAt) r = writeRace({ ...r, endsAt: t + CONFIG.afterFirst });
-    if ((done.length && humansDone && humans.length) || (r.endsAt && t > r.endsAt) || t - r.startAt > 300000 || (ATTRACT && done.length >= 3)) {
+    if (done.length && humansDone && humans.length && r.endsAt > t + CONFIG.botsAfterLast) r = writeRace({ ...r, endsAt: t + CONFIG.botsAfterLast }); // everyone's home: the bots still racing get a few seconds to finish
+    if (done.length === all.length || (r.endsAt && t > r.endsAt) || t - r.startAt > 300000 || (ATTRACT && done.length >= 3)) {
       r = writeRace({ ...r, phase: "done", endsAt: t + CONFIG.resultsFor, results: all.map((x) => ({ id: x.id, n: x.name === "You" ? myName : x.name, ft: x.ft || 0 })) });
     }
   }
